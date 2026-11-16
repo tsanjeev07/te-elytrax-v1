@@ -2,23 +2,18 @@
  * ELYTRAx V1 — Lightweight Esports Management Bot (Discord.js v14)
  * Built for Team Elytra (BGMI / Free Fire / Mobile Esports)
  *
- * Included Quotient Esports Modules (Zero Bloat, No Points Table Maker):
- *  1. Scrims Manager (/scrim)       — Auto-open (IST), mention checks, duplicate tag filter, reserved slots, bans, auto-slotlist
- *  2. Slot Manager (/slotm)         — Interactive Cancel / Claim / Transfer slot buttons with live slotlist & role sync
- *  3. Tournament Manager (/tourney) — Multi-slot tourneys, fake-tag check, auto group divider (Group A/B/C...), CSV export
+ * Core Esports Modules (Zero Bloat — No Points Table Maker, No SS-Verify):
+ *  1. Scrims Manager (/scrim)       — Auto-creates Role + Category + #register + #slotlist + separate private #idp channel
+ *  2. Slot Manager (/slotm)         — Interactive Cancel / Claim / Transfer slot buttons with live slotlist & IDP role sync
+ *  3. Tournament Manager (/tourney) — Auto-creates Role & Channels, fake-tag filter, CSV export, and Auto Group Builder
+ *                                     (/tourney groups creates Group A/B/C roles, assigns captains, & creates per-group slot + IDP channels)
  *  4. Tag Check (/tagcheck)         — Pre-registration format & mention validator channel
  *  5. EasyTag (/eztag)              — Converts plain text / mentions into copy-pasteable squad registration format
- *  6. SS-Verify (/ssverify)         — Screenshot count & image type verifier for auto-assigning Verified roles
- *  7. IDP Broadcaster (/idp)        — Formatted Room ID & Password embed sender with role ping and auto-delete timer
+ *  6. IDP Broadcaster (/idp)        — Posts formatted Room ID & Password embed to the separate IDP channel with auto-delete timer
  *
- * Quick Setup (PowerShell or Linux):
- *  1. npm init -y
- *  2. npm install discord.js dotenv
- *  3. Create a .env file with:
- *       DISCORD_TOKEN=your_bot_token_here
- *       CLIENT_ID=your_application_client_id_here
- *  4. Enable "Message Content Intent" and "Server Members Intent" in Discord Developer Portal -> Bot.
- *  5. Run: node elytrax_v1.js
+ * Required Bot Permissions in Discord Server:
+ *  - Administrator (or Manage Roles, Manage Channels, Manage Messages, View Channels, Send Messages, Embed Links)
+ *  - Bot's highest role MUST be dragged above any Scrim/Tourney roles it manages.
  */
 
 require('dotenv').config();
@@ -49,11 +44,10 @@ const {
 const DB_FILE = path.join(__dirname, 'elytrax_db.json');
 
 const defaultDB = {
-  scrims: {},      // keyed by regChannelId
-  tourneys: {},    // keyed by regChannelId
-  tagcheck: {},    // keyed by channelId: { mentions: number }
-  eztag: {},       // keyed by channelId: { enabled: boolean }
-  ssverify: {},    // keyed by channelId: { roleId, requiredCount, submissions: { userId: count } }
+  scrims: {},   // keyed by regChannelId
+  tourneys: {}, // keyed by regChannelId
+  tagcheck: {}, // keyed by channelId: { mentions: number }
+  eztag: {},    // keyed by channelId: { enabled: boolean }
 };
 
 function loadDB() {
@@ -63,7 +57,9 @@ function loadDB() {
       return JSON.parse(JSON.stringify(defaultDB));
     }
     const raw = fs.readFileSync(DB_FILE, 'utf8');
-    return { ...defaultDB, ...JSON.parse(raw) };
+    const parsed = JSON.parse(raw);
+    delete parsed.ssverify; // Clean up legacy ssverify key if present
+    return { ...defaultDB, ...parsed };
   } catch (err) {
     console.error('[DB] Failed to load database, initializing fresh state:', err.message);
     return JSON.parse(JSON.stringify(defaultDB));
@@ -101,7 +97,17 @@ function getISTTimeHHMM() {
 }
 
 function getISTDateKey() {
-  return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // YYYY-MM-DD
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+}
+
+function slugifyChannelName(str) {
+  return (
+    str
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 24) || 'esports'
+  );
 }
 
 function extractTeamName(content) {
@@ -152,6 +158,11 @@ function buildScrimSlotlistEmbed(scrim) {
         inline: true,
       },
       {
+        name: 'IDP Channel',
+        value: scrim.idpChannelId ? `<#${scrim.idpChannelId}>` : 'Not set',
+        inline: true,
+      },
+      {
         name: 'Status',
         value: scrim.isOpen ? '🟢 Registration Open' : '🔴 Registration Closed',
         inline: true,
@@ -161,20 +172,38 @@ function buildScrimSlotlistEmbed(scrim) {
     .setTimestamp();
 }
 
+function buildSlotManagerComponents(regChannelId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`slotm_cancel_${regChannelId}`)
+      .setLabel('Cancel My Slot')
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId(`slotm_claim_${regChannelId}`)
+      .setLabel('Claim Open Slot')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`slotm_transfer_${regChannelId}`)
+      .setLabel('Transfer Slot')
+      .setStyle(ButtonStyle.Secondary)
+  );
+}
+
 async function syncScrimSlotlistMessage(guild, scrim) {
   try {
     const slotChannel = await guild.channels.fetch(scrim.slotChannelId).catch(() => null);
     if (!slotChannel) return;
     const embed = buildScrimSlotlistEmbed(scrim);
+    const row = buildSlotManagerComponents(scrim.regChannelId);
 
     if (scrim.slotlistMessageId) {
       const existing = await slotChannel.messages.fetch(scrim.slotlistMessageId).catch(() => null);
       if (existing) {
-        await existing.edit({ embeds: [embed] });
+        await existing.edit({ embeds: [embed], components: [row] });
         return;
       }
     }
-    const sent = await slotChannel.send({ embeds: [embed] });
+    const sent = await slotChannel.send({ embeds: [embed], components: [row] });
     scrim.slotlistMessageId = sent.id;
     saveDB();
   } catch (err) {
@@ -196,7 +225,6 @@ async function setChannelSendLock(guild, channelId, allowSend) {
 
 async function openScrimRegistration(guild, scrim) {
   scrim.isOpen = true;
-  // Reset non-reserved slots on fresh open
   scrim.slots = (scrim.slots || []).filter((s) => s.reserved);
   saveDB();
 
@@ -226,6 +254,7 @@ async function openScrimRegistration(guild, scrim) {
         `**Available Slots:** \`${openSlotsCount}\` / \`${scrim.totalSlots}\``,
         `**Required Mentions:** \`${scrim.requiredMentions}\` unique players`,
         `**IDP Role:** <@&${scrim.idpRoleId}>`,
+        `**IDP Channel:** <#${scrim.idpChannelId}>`,
         '',
         '**Format:**',
         '```',
@@ -238,6 +267,7 @@ async function openScrimRegistration(guild, scrim) {
     .setTimestamp();
 
   await regChannel.send({ content: pingText || null, embeds: [embed] });
+  await syncScrimSlotlistMessage(guild, scrim);
 }
 
 async function closeScrimRegistration(guild, scrim, reason = 'All slots filled or closed by staff.') {
@@ -251,7 +281,9 @@ async function closeScrimRegistration(guild, scrim, reason = 'All slots filled o
     const embed = new EmbedBuilder()
       .setColor(BRAND_COLOR)
       .setTitle(`🔴 ${scrim.name} — Registration Closed`)
-      .setDescription(`${reason}\nCheck <#${scrim.slotChannelId}> for the official slotlist.`)
+      .setDescription(
+        `${reason}\n• **Slotlist & Cancel/Claim:** <#${scrim.slotChannelId}>\n• **Room ID & Password:** <#${scrim.idpChannelId}>`
+      )
       .setTimestamp();
     await regChannel.send({ embeds: [embed] }).catch(() => null);
   }
@@ -260,28 +292,31 @@ async function closeScrimRegistration(guild, scrim, reason = 'All slots filled o
 }
 
 // ============================================================================
-// 3. SLASH COMMAND DEFINITIONS
+// 3. SLASH COMMAND DEFINITIONS (NO SSVERIFY, NO PT MAKER)
 // ============================================================================
 const commands = [
   // 1. SCRIM MANAGER
   new SlashCommandBuilder()
     .setName('scrim')
-    .setDescription('Manage automated esports scrims (Quotient Scrims Manager)')
+    .setDescription('Manage automated esports scrims with auto-created roles & separate IDP channel')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand((sub) =>
       sub
         .setName('create')
-        .setDescription('Create a new scrim configuration')
+        .setDescription('Create a scrim (auto-creates IDP Role, #register, #slotlist, & private #idp if omitted)')
         .addStringOption((o) => o.setName('name').setDescription('Scrim title (e.g. Elytra Evening Scrims)').setRequired(true))
-        .addChannelOption((o) =>
-          o.setName('reg_channel').setDescription('Registration channel').addChannelTypes(ChannelType.GuildText).setRequired(true)
-        )
-        .addChannelOption((o) =>
-          o.setName('slot_channel').setDescription('Slotlist & Cancel-Claim channel').addChannelTypes(ChannelType.GuildText).setRequired(true)
-        )
-        .addRoleOption((o) => o.setName('idp_role').setDescription('Role given to registered captains').setRequired(true))
         .addIntegerOption((o) => o.setName('total_slots').setDescription('Total slots (e.g. 16, 20, 25)').setMinValue(2).setMaxValue(30).setRequired(true))
         .addIntegerOption((o) => o.setName('mentions').setDescription('Required @mentions per team (e.g. 4)').setMinValue(0).setMaxValue(6).setRequired(true))
+        .addChannelOption((o) =>
+          o.setName('reg_channel').setDescription('Existing registration channel (leave blank to auto-create)').addChannelTypes(ChannelType.GuildText)
+        )
+        .addChannelOption((o) =>
+          o.setName('slot_channel').setDescription('Existing slotlist channel (leave blank to auto-create)').addChannelTypes(ChannelType.GuildText)
+        )
+        .addChannelOption((o) =>
+          o.setName('idp_channel').setDescription('Existing separate IDP channel (leave blank to auto-create private IDP channel)').addChannelTypes(ChannelType.GuildText)
+        )
+        .addRoleOption((o) => o.setName('idp_role').setDescription('Existing IDP role (leave blank to auto-create role)'))
         .addStringOption((o) => o.setName('open_time').setDescription('Daily auto-open time in IST 24h format (e.g. 14:00)'))
         .addRoleOption((o) => o.setName('ping_role').setDescription('Role to ping when registration opens'))
         .addBooleanOption((o) => o.setName('auto_clean').setDescription('Purge old messages in reg channel before opening'))
@@ -323,16 +358,17 @@ const commands = [
         .addUserOption((o) => o.setName('user').setDescription('Target user').setRequired(true))
     )
     .addSubcommand((sub) =>
-      sub
-        .setName('list')
-        .setDescription('List all configured scrims in this server')
+      sub.setName('list').setDescription('List all configured scrims in this server')
     )
     .addSubcommand((sub) =>
       sub
         .setName('delete')
-        .setDescription('Delete a scrim configuration')
+        .setDescription('Delete a scrim configuration (and optionally its auto-created channels/role)')
         .addChannelOption((o) =>
           o.setName('reg_channel').setDescription('Scrim registration channel').addChannelTypes(ChannelType.GuildText).setRequired(true)
+        )
+        .addBooleanOption((o) =>
+          o.setName('delete_channels').setDescription('Also delete the scrim channels and IDP role from the server')
         )
     ),
 
@@ -350,25 +386,28 @@ const commands = [
         )
     ),
 
-  // 3. TOURNAMENT MANAGER
+  // 3. TOURNAMENT MANAGER (WITH AUTO ROLE/CHANNEL CREATION & GROUP CHANNEL/ROLE GENERATOR)
   new SlashCommandBuilder()
     .setName('tourney')
-    .setDescription('Manage esports tournaments, groups, and CSV exports')
+    .setDescription('Manage tournaments, auto-create Group roles/channels + separate IDP channels, & export CSV')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand((sub) =>
       sub
         .setName('create')
-        .setDescription('Create a new tournament')
+        .setDescription('Create a tournament (auto-creates Role, #register, #confirmed, & private #idp if omitted)')
         .addStringOption((o) => o.setName('name').setDescription('Tournament name').setRequired(true))
-        .addChannelOption((o) =>
-          o.setName('reg_channel').setDescription('Registration channel').addChannelTypes(ChannelType.GuildText).setRequired(true)
-        )
-        .addChannelOption((o) =>
-          o.setName('confirm_channel').setDescription('Confirmed teams log channel').addChannelTypes(ChannelType.GuildText).setRequired(true)
-        )
-        .addRoleOption((o) => o.setName('role').setDescription('Role given to registered tournament captains').setRequired(true))
         .addIntegerOption((o) => o.setName('total_slots').setDescription('Total tournament slots (e.g. 24, 32, 64, 128)').setMinValue(4).setMaxValue(500).setRequired(true))
         .addIntegerOption((o) => o.setName('mentions').setDescription('Required @mentions per squad').setMinValue(0).setMaxValue(6).setRequired(true))
+        .addChannelOption((o) =>
+          o.setName('reg_channel').setDescription('Existing registration channel (leave blank to auto-create)').addChannelTypes(ChannelType.GuildText)
+        )
+        .addChannelOption((o) =>
+          o.setName('confirm_channel').setDescription('Existing confirmed teams channel (leave blank to auto-create)').addChannelTypes(ChannelType.GuildText)
+        )
+        .addChannelOption((o) =>
+          o.setName('idp_channel').setDescription('Existing separate IDP channel (leave blank to auto-create)').addChannelTypes(ChannelType.GuildText)
+        )
+        .addRoleOption((o) => o.setName('role').setDescription('Existing captain role (leave blank to auto-create role)'))
     )
     .addSubcommand((sub) =>
       sub
@@ -389,12 +428,20 @@ const commands = [
     .addSubcommand((sub) =>
       sub
         .setName('groups')
-        .setDescription('Auto-divide registered tournament teams into balanced groups (Group A, B, C...)')
+        .setDescription('Divide teams into Groups & AUTO-CREATE Group Roles, Group Slot Channels, & separate Group IDP Channels')
         .addChannelOption((o) =>
           o.setName('reg_channel').setDescription('Tournament registration channel').addChannelTypes(ChannelType.GuildText).setRequired(true)
         )
         .addIntegerOption((o) => o.setName('group_size').setDescription('Teams per group (e.g. 12 for Free Fire, 16 or 20 for BGMI)').setMinValue(2).setMaxValue(30).setRequired(true))
         .addBooleanOption((o) => o.setName('shuffle').setDescription('Shuffle teams randomly before grouping'))
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName('cleanup_groups')
+        .setDescription('Delete all auto-created Group Roles and Group Channels for a tournament')
+        .addChannelOption((o) =>
+          o.setName('reg_channel').setDescription('Tournament registration channel').addChannelTypes(ChannelType.GuildText).setRequired(true)
+        )
     )
     .addSubcommand((sub) =>
       sub
@@ -416,9 +463,12 @@ const commands = [
     .addSubcommand((sub) =>
       sub
         .setName('delete')
-        .setDescription('Delete a tournament configuration')
+        .setDescription('Delete a tournament configuration (and optionally all its created roles/channels)')
         .addChannelOption((o) =>
           o.setName('reg_channel').setDescription('Tournament registration channel').addChannelTypes(ChannelType.GuildText).setRequired(true)
+        )
+        .addBooleanOption((o) =>
+          o.setName('delete_channels').setDescription('Also delete created tournament/group channels and roles')
         )
     ),
 
@@ -445,34 +495,19 @@ const commands = [
       o.setName('enabled').setDescription('Enable or disable EasyTag in this channel').setRequired(true)
     ),
 
-  // 5. SCREENSHOT VERIFICATION (SSVERIFY)
-  new SlashCommandBuilder()
-    .setName('ssverify')
-    .setDescription('Configure screenshot verification (YouTube/Instagram sub proof) for role unlock')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addChannelOption((o) =>
-      o.setName('channel').setDescription('Verification channel').addChannelTypes(ChannelType.GuildText).setRequired(true)
-    )
-    .addRoleOption((o) =>
-      o.setName('verified_role').setDescription('Role granted once screenshots are submitted').setRequired(true)
-    )
-    .addIntegerOption((o) =>
-      o.setName('required_screenshots').setDescription('Number of screenshots required (0 to disable)').setMinValue(0).setMaxValue(10).setRequired(true)
-    )
-    .addStringOption((o) =>
-      o.setName('instructions').setDescription('Custom instructions (e.g. Subscribe to Team Elytra YT & follow IG)')
-    ),
-
-  // 6. IDP BROADCASTER
+  // 5. IDP BROADCASTER (SENDS DIRECTLY TO SEPARATE IDP CHANNEL)
   new SlashCommandBuilder()
     .setName('idp')
-    .setDescription('Broadcast formatted BGMI / Free Fire Room ID & Password embed')
+    .setDescription('Broadcast formatted Room ID & Password embed to a dedicated IDP channel')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
     .addStringOption((o) => o.setName('room_id').setDescription('Custom Room ID').setRequired(true))
     .addStringOption((o) => o.setName('password').setDescription('Room Password').setRequired(true))
     .addStringOption((o) => o.setName('map').setDescription('Map name (e.g. Erangel, Miramar, Rondo, Bermuda)').setRequired(true))
     .addStringOption((o) => o.setName('start_time').setDescription('Match start time (e.g. 08:15 PM IST)').setRequired(true))
-    .addRoleOption((o) => o.setName('ping_role').setDescription('IDP Role to ping'))
+    .addChannelOption((o) =>
+      o.setName('idp_channel').setDescription('Target separate IDP channel (defaults to current channel if omitted)').addChannelTypes(ChannelType.GuildText)
+    )
+    .addRoleOption((o) => o.setName('ping_role').setDescription('IDP or Group Role to ping'))
     .addIntegerOption((o) =>
       o.setName('autodelete_mins').setDescription('Auto-delete IDP message after N minutes (optional)').setMinValue(1).setMaxValue(120)
     ),
@@ -540,26 +575,132 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isChatInputCommand()) {
       const { commandName } = interaction;
 
+      // ======================================================================
       // 1. /scrim
+      // ======================================================================
       if (commandName === 'scrim') {
         const sub = interaction.options.getSubcommand();
 
         if (sub === 'create') {
+          await interaction.deferReply();
+          const guild = interaction.guild;
           const name = interaction.options.getString('name', true);
-          const regChannel = interaction.options.getChannel('reg_channel', true);
-          const slotChannel = interaction.options.getChannel('slot_channel', true);
-          const idpRole = interaction.options.getRole('idp_role', true);
           const totalSlots = interaction.options.getInteger('total_slots', true);
           const mentions = interaction.options.getInteger('mentions', true);
+          let regChannel = interaction.options.getChannel('reg_channel');
+          let slotChannel = interaction.options.getChannel('slot_channel');
+          let idpChannel = interaction.options.getChannel('idp_channel');
+          let idpRole = interaction.options.getRole('idp_role');
           const openTime = interaction.options.getString('open_time') || null;
           const pingRole = interaction.options.getRole('ping_role') || null;
           const autoClean = interaction.options.getBoolean('auto_clean') ?? true;
 
+          const slug = slugifyChannelName(name);
+          let categoryId = null;
+
+          // 1. Auto-create IDP Role if not provided
+          if (!idpRole) {
+            idpRole = await guild.roles.create({
+              name: `${name} IDP`,
+              color: BRAND_COLOR,
+              mentionable: true,
+              reason: `ELYTRAx V1 auto-created IDP role for scrim ${name}`,
+            });
+          }
+
+          // 2. Auto-create Category if any channel is missing
+          if (!regChannel || !slotChannel || !idpChannel) {
+            const category = await guild.channels.create({
+              name: `🔥 ${name}`,
+              type: ChannelType.GuildCategory,
+            });
+            categoryId = category.id;
+          }
+
+          // 3. Auto-create Registration Channel if not provided
+          if (!regChannel) {
+            regChannel = await guild.channels.create({
+              name: `${slug}-register`,
+              type: ChannelType.GuildText,
+              parent: categoryId,
+              permissionOverwrites: [
+                {
+                  id: guild.roles.everyone.id,
+                  allow: [PermissionFlagsBits.ViewChannel],
+                  deny: [PermissionFlagsBits.SendMessages],
+                },
+                {
+                  id: client.user.id,
+                  allow: [
+                    PermissionFlagsBits.ViewChannel,
+                    PermissionFlagsBits.SendMessages,
+                    PermissionFlagsBits.ManageMessages,
+                    PermissionFlagsBits.ManageChannels,
+                  ],
+                },
+              ],
+            });
+          }
+
+          // 4. Auto-create Slotlist & Cancel/Claim Channel if not provided
+          if (!slotChannel) {
+            slotChannel = await guild.channels.create({
+              name: `${slug}-slotlist`,
+              type: ChannelType.GuildText,
+              parent: categoryId,
+              permissionOverwrites: [
+                {
+                  id: guild.roles.everyone.id,
+                  allow: [PermissionFlagsBits.ViewChannel],
+                  deny: [PermissionFlagsBits.SendMessages],
+                },
+                {
+                  id: client.user.id,
+                  allow: [
+                    PermissionFlagsBits.ViewChannel,
+                    PermissionFlagsBits.SendMessages,
+                    PermissionFlagsBits.ManageMessages,
+                  ],
+                },
+              ],
+            });
+          }
+
+          // 5. Auto-create Separate Private IDP Channel if not provided
+          if (!idpChannel) {
+            idpChannel = await guild.channels.create({
+              name: `${slug}-idp`,
+              type: ChannelType.GuildText,
+              parent: categoryId,
+              permissionOverwrites: [
+                {
+                  id: guild.roles.everyone.id,
+                  deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages],
+                },
+                {
+                  id: idpRole.id,
+                  allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
+                  deny: [PermissionFlagsBits.SendMessages],
+                },
+                {
+                  id: client.user.id,
+                  allow: [
+                    PermissionFlagsBits.ViewChannel,
+                    PermissionFlagsBits.SendMessages,
+                    PermissionFlagsBits.ManageMessages,
+                  ],
+                },
+              ],
+            });
+          }
+
           db.scrims[regChannel.id] = {
-            guildId: interaction.guildId,
+            guildId: guild.id,
             name,
+            categoryId,
             regChannelId: regChannel.id,
             slotChannelId: slotChannel.id,
+            idpChannelId: idpChannel.id,
             idpRoleId: idpRole.id,
             pingRoleId: pingRole ? pingRole.id : null,
             totalSlots,
@@ -574,19 +715,22 @@ client.on('interactionCreate', async (interaction) => {
           };
           saveDB();
 
-          return interaction.reply({
+          // Post initial Slotlist + Cancel/Claim buttons in slotChannel
+          await syncScrimSlotlistMessage(guild, db.scrims[regChannel.id]);
+
+          return interaction.editReply({
             embeds: [
               new EmbedBuilder()
                 .setColor(SUCCESS_COLOR)
-                .setTitle(`✅ Scrim Created — ${name}`)
+                .setTitle(`✅ Scrim Configured — ${name}`)
                 .setDescription(
                   [
                     `**Registration Channel:** <#${regChannel.id}>`,
-                    `**Slotlist Channel:** <#${slotChannel.id}>`,
+                    `**Slotlist & Cancel/Claim Channel:** <#${slotChannel.id}>`,
+                    `**Separate Private IDP Channel:** <#${idpChannel.id}>`,
                     `**IDP Role:** <@&${idpRole.id}>`,
                     `**Total Slots:** \`${totalSlots}\` | **Required Mentions:** \`${mentions}\``,
                     `**Daily Auto-Open (IST):** \`${openTime || 'Manual (/scrim start)'}\``,
-                    `**Auto-Clean Channel:** \`${autoClean ? 'Yes' : 'No'}\``,
                   ].join('\n')
                 ),
             ],
@@ -612,7 +756,7 @@ client.on('interactionCreate', async (interaction) => {
           }
           await interaction.deferReply({ ephemeral: true });
           await closeScrimRegistration(interaction.guild, scrim, 'Closed manually by staff.');
-          return interaction.editReply(`✅ Closed **${scrim.name}** and posted slotlist in <#${scrim.slotChannelId}>.`);
+          return interaction.editReply(`✅ Closed **${scrim.name}** and updated <#${scrim.slotChannelId}>.`);
         }
 
         if (sub === 'reserve') {
@@ -643,6 +787,7 @@ client.on('interactionCreate', async (interaction) => {
           const member = await interaction.guild.members.fetch(leader.id).catch(() => null);
           if (member) await member.roles.add(scrim.idpRoleId).catch(() => null);
 
+          await syncScrimSlotlistMessage(interaction.guild, scrim);
           return interaction.reply({
             content: `✅ Reserved **Slot ${slotNum}** for **${teamName}** (<@${leader.id}>) in **${scrim.name}**.`,
           });
@@ -674,7 +819,7 @@ client.on('interactionCreate', async (interaction) => {
           }
           const lines = guildScrims.map(
             (s) =>
-              `• **${s.name}** — Reg: <#${s.regChannelId}> | Slots: \`${s.slots.length}/${s.totalSlots}\` | Open: \`${s.openTime || 'Manual'}\` | Status: ${s.isOpen ? '🟢 Open' : '🔴 Closed'}`
+              `• **${s.name}** — Reg: <#${s.regChannelId}> | Slotlist: <#${s.slotChannelId}> | IDP: <#${s.idpChannelId}> | Slots: \`${s.slots.length}/${s.totalSlots}\` | Status: ${s.isOpen ? '🟢 Open' : '🔴 Closed'}`
           );
           return interaction.reply({
             embeds: [
@@ -688,17 +833,38 @@ client.on('interactionCreate', async (interaction) => {
 
         if (sub === 'delete') {
           const regChannel = interaction.options.getChannel('reg_channel', true);
-          if (!db.scrims[regChannel.id]) {
+          const deleteChannels = interaction.options.getBoolean('delete_channels') ?? false;
+          const scrim = db.scrims[regChannel.id];
+          if (!scrim) {
             return interaction.reply({ content: '❌ No scrim found for that channel.', ephemeral: true });
           }
-          const removedName = db.scrims[regChannel.id].name;
+
+          await interaction.deferReply({ ephemeral: true });
+          const removedName = scrim.name;
           delete db.scrims[regChannel.id];
           saveDB();
-          return interaction.reply(`🗑️ Deleted scrim **${removedName}**.`);
+
+          if (deleteChannels) {
+            const guild = interaction.guild;
+            for (const chId of [scrim.regChannelId, scrim.slotChannelId, scrim.idpChannelId, scrim.categoryId]) {
+              if (chId) {
+                const ch = await guild.channels.fetch(chId).catch(() => null);
+                if (ch) await ch.delete().catch(() => null);
+              }
+            }
+            if (scrim.idpRoleId) {
+              const role = await guild.roles.fetch(scrim.idpRoleId).catch(() => null);
+              if (role) await role.delete().catch(() => null);
+            }
+          }
+
+          return interaction.editReply(`🗑️ Deleted scrim **${removedName}**.`);
         }
       }
 
+      // ======================================================================
       // 2. /slotm (Slot Manager — Cancel / Claim / Transfer)
+      // ======================================================================
       if (commandName === 'slotm') {
         const regChannel = interaction.options.getChannel('reg_channel', true);
         const scrim = db.scrims[regChannel.id];
@@ -712,69 +878,168 @@ client.on('interactionCreate', async (interaction) => {
           .setDescription(
             [
               'Use the buttons below to manage your squad slot in real time:',
-              '• **Cancel Slot:** Free up your slot if your team cannot play.',
-              '• **Claim Slot:** Claim any open/cancelled slot if your squad missed registration.',
+              '• **Cancel My Slot:** Free up your slot if your team cannot play.',
+              '• **Claim Open Slot:** Claim any open/cancelled slot if your squad missed registration.',
               '• **Transfer Slot:** Hand over your slot & IDP role to another captain.',
             ].join('\n')
           )
           .setFooter({ text: `Linked to #${regChannel.name}` });
 
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId(`slotm_cancel_${scrim.regChannelId}`)
-            .setLabel('Cancel My Slot')
-            .setStyle(ButtonStyle.Danger),
-          new ButtonBuilder()
-            .setCustomId(`slotm_claim_${scrim.regChannelId}`)
-            .setLabel('Claim Open Slot')
-            .setStyle(ButtonStyle.Success),
-          new ButtonBuilder()
-            .setCustomId(`slotm_transfer_${scrim.regChannelId}`)
-            .setLabel('Transfer Slot')
-            .setStyle(ButtonStyle.Secondary)
-        );
-
+        const row = buildSlotManagerComponents(scrim.regChannelId);
         await interaction.channel.send({ embeds: [embed], components: [row] });
         return interaction.reply({ content: '✅ Slot Manager panel deployed.', ephemeral: true });
       }
 
-      // 3. /tourney
+      // ======================================================================
+      // 3. /tourney (Tournament Manager + Auto Group Roles & Channels)
+      // ======================================================================
       if (commandName === 'tourney') {
         const sub = interaction.options.getSubcommand();
 
         if (sub === 'create') {
+          await interaction.deferReply();
+          const guild = interaction.guild;
           const name = interaction.options.getString('name', true);
-          const regChannel = interaction.options.getChannel('reg_channel', true);
-          const confirmChannel = interaction.options.getChannel('confirm_channel', true);
-          const role = interaction.options.getRole('role', true);
           const totalSlots = interaction.options.getInteger('total_slots', true);
           const mentions = interaction.options.getInteger('mentions', true);
+          let regChannel = interaction.options.getChannel('reg_channel');
+          let confirmChannel = interaction.options.getChannel('confirm_channel');
+          let idpChannel = interaction.options.getChannel('idp_channel');
+          let role = interaction.options.getRole('role');
+
+          const slug = slugifyChannelName(name);
+          let categoryId = null;
+
+          // 1. Auto-create Tournament Role if omitted
+          if (!role) {
+            role = await guild.roles.create({
+              name: `${name} Player`,
+              color: SUCCESS_COLOR,
+              mentionable: true,
+              reason: `ELYTRAx V1 auto-created tournament role for ${name}`,
+            });
+          }
+
+          // 2. Auto-create Category if any channel is omitted
+          if (!regChannel || !confirmChannel || !idpChannel) {
+            const category = await guild.channels.create({
+              name: `🏆 ${name}`,
+              type: ChannelType.GuildCategory,
+            });
+            categoryId = category.id;
+          }
+
+          // 3. Auto-create Registration Channel if omitted
+          if (!regChannel) {
+            regChannel = await guild.channels.create({
+              name: `${slug}-register`,
+              type: ChannelType.GuildText,
+              parent: categoryId,
+              permissionOverwrites: [
+                {
+                  id: guild.roles.everyone.id,
+                  allow: [PermissionFlagsBits.ViewChannel],
+                  deny: [PermissionFlagsBits.SendMessages],
+                },
+                {
+                  id: client.user.id,
+                  allow: [
+                    PermissionFlagsBits.ViewChannel,
+                    PermissionFlagsBits.SendMessages,
+                    PermissionFlagsBits.ManageMessages,
+                    PermissionFlagsBits.ManageChannels,
+                  ],
+                },
+              ],
+            });
+          }
+
+          // 4. Auto-create Confirmed Teams Channel if omitted
+          if (!confirmChannel) {
+            confirmChannel = await guild.channels.create({
+              name: `${slug}-confirmed`,
+              type: ChannelType.GuildText,
+              parent: categoryId,
+              permissionOverwrites: [
+                {
+                  id: guild.roles.everyone.id,
+                  allow: [PermissionFlagsBits.ViewChannel],
+                  deny: [PermissionFlagsBits.SendMessages],
+                },
+                {
+                  id: client.user.id,
+                  allow: [
+                    PermissionFlagsBits.ViewChannel,
+                    PermissionFlagsBits.SendMessages,
+                    PermissionFlagsBits.ManageMessages,
+                  ],
+                },
+              ],
+            });
+          }
+
+          // 5. Auto-create Separate Private IDP Channel if omitted
+          if (!idpChannel) {
+            idpChannel = await guild.channels.create({
+              name: `${slug}-idp`,
+              type: ChannelType.GuildText,
+              parent: categoryId,
+              permissionOverwrites: [
+                {
+                  id: guild.roles.everyone.id,
+                  deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages],
+                },
+                {
+                  id: role.id,
+                  allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
+                  deny: [PermissionFlagsBits.SendMessages],
+                },
+                {
+                  id: client.user.id,
+                  allow: [
+                    PermissionFlagsBits.ViewChannel,
+                    PermissionFlagsBits.SendMessages,
+                    PermissionFlagsBits.ManageMessages,
+                  ],
+                },
+              ],
+            });
+          }
 
           db.tourneys[regChannel.id] = {
-            guildId: interaction.guildId,
+            guildId: guild.id,
             name,
+            categoryId,
             regChannelId: regChannel.id,
             confirmChannelId: confirmChannel.id,
+            idpChannelId: idpChannel.id,
             roleId: role.id,
             totalSlots,
             requiredMentions: mentions,
             isOpen: false,
             teams: [],
+            createdGroups: {
+              categoryId: null,
+              roleIds: [],
+              channelIds: [],
+            },
           };
           saveDB();
 
-          return interaction.reply({
+          return interaction.editReply({
             embeds: [
               new EmbedBuilder()
                 .setColor(SUCCESS_COLOR)
-                .setTitle(`🏆 Tournament Created — ${name}`)
+                .setTitle(`🏆 Tournament Configured — ${name}`)
                 .setDescription(
                   [
                     `**Registration Channel:** <#${regChannel.id}>`,
-                    `**Confirm Channel:** <#${confirmChannel.id}>`,
-                    `**Captain Role:** <@&${role.id}>`,
+                    `**Confirmed Teams Channel:** <#${confirmChannel.id}>`,
+                    `**Separate Private IDP Channel:** <#${idpChannel.id}>`,
+                    `**Tournament Role:** <@&${role.id}>`,
                     `**Total Slots:** \`${totalSlots}\` | **Required Mentions:** \`${mentions}\``,
-                    'Run `/tourney start` when ready to open registrations.',
+                    '',
+                    'Run `/tourney start` to open registrations, and `/tourney groups` once filled to auto-create Group A/B/C roles, slot channels, and separate group IDP channels!',
                   ].join('\n')
                 ),
             ],
@@ -797,7 +1062,18 @@ client.on('interactionCreate', async (interaction) => {
                 .setColor(SUCCESS_COLOR)
                 .setTitle(`🏆 ${tourney.name} — Registration Open`)
                 .setDescription(
-                  `Slots: \`${tourney.teams.length}/${tourney.totalSlots}\`\nRequired Mentions: \`${tourney.requiredMentions}\` unique players.`
+                  [
+                    `**Slots:** \`${tourney.teams.length} / ${tourney.totalSlots}\``,
+                    `**Required Mentions:** \`${tourney.requiredMentions}\` unique players`,
+                    `**Confirmed Teams:** <#${tourney.confirmChannelId}>`,
+                    `**IDP Channel:** <#${tourney.idpChannelId}>`,
+                    '',
+                    '**Format:**',
+                    '```',
+                    'Team Name: Your Squad Name',
+                    '@Player1 @Player2 @Player3 @Player4',
+                    '```',
+                  ].join('\n')
                 ),
             ],
           });
@@ -816,16 +1092,42 @@ client.on('interactionCreate', async (interaction) => {
           return interaction.reply(`⏸️ Paused/closed registrations for **${tourney.name}**.`);
         }
 
+        // AUTO-CREATE GROUP ROLES, ASSIGN TO CAPTAINS, & CREATE GROUP SLOT + SEPARATE IDP CHANNELS
         if (sub === 'groups') {
           const regChannel = interaction.options.getChannel('reg_channel', true);
           const groupSize = interaction.options.getInteger('group_size', true);
           const shuffle = interaction.options.getBoolean('shuffle') ?? false;
           const tourney = db.tourneys[regChannel.id];
+
           if (!tourney || tourney.teams.length === 0) {
             return interaction.reply({ content: '❌ No registered teams found for that tournament.', ephemeral: true });
           }
 
           await interaction.deferReply();
+          const guild = interaction.guild;
+
+          // Clean up any previously generated group channels/roles for this tourney first
+          if (tourney.createdGroups) {
+            for (const chId of tourney.createdGroups.channelIds || []) {
+              const ch = await guild.channels.fetch(chId).catch(() => null);
+              if (ch) await ch.delete().catch(() => null);
+            }
+            if (tourney.createdGroups.categoryId) {
+              const cat = await guild.channels.fetch(tourney.createdGroups.categoryId).catch(() => null);
+              if (cat) await cat.delete().catch(() => null);
+            }
+            for (const rId of tourney.createdGroups.roleIds || []) {
+              const r = await guild.roles.fetch(rId).catch(() => null);
+              if (r) await r.delete().catch(() => null);
+            }
+          }
+
+          tourney.createdGroups = {
+            categoryId: null,
+            roleIds: [],
+            channelIds: [],
+          };
+
           const list = [...tourney.teams];
           if (shuffle) {
             for (let i = list.length - 1; i > 0; i--) {
@@ -834,26 +1136,172 @@ client.on('interactionCreate', async (interaction) => {
             }
           }
 
-          const embeds = [];
+          // Create Groups Category
+          const groupCategory = await guild.channels.create({
+            name: `⚔️ ${tourney.name} — Groups`,
+            type: ChannelType.GuildCategory,
+          });
+          tourney.createdGroups.categoryId = groupCategory.id;
+
           const totalGroups = Math.ceil(list.length / groupSize);
+          const summaryLines = [];
+          const slug = slugifyChannelName(tourney.name);
+
           for (let g = 0; g < totalGroups; g++) {
-            const groupLetter = String.fromCharCode(65 + g);
+            const groupLetter = String.fromCharCode(65 + g); // A, B, C...
+            const groupLower = groupLetter.toLowerCase();
             const slice = list.slice(g * groupSize, (g + 1) * groupSize);
+
+            // 1. Create dedicated Group Role
+            const groupRole = await guild.roles.create({
+              name: `${tourney.name} Group ${groupLetter}`,
+              color: BRAND_COLOR,
+              mentionable: true,
+              reason: `Auto-created Group ${groupLetter} role for ${tourney.name}`,
+            });
+            tourney.createdGroups.roleIds.push(groupRole.id);
+
+            // 2. Assign Group Role to all captains (and mentioned roster members) in this group
+            for (const team of slice) {
+              const memberIds = new Set([team.leaderId, ...(team.players || [])]);
+              for (const uid of memberIds) {
+                const member = await guild.members.fetch(uid).catch(() => null);
+                if (member) {
+                  await member.roles.add(groupRole.id).catch(() => null);
+                }
+              }
+            }
+
+            // 3. Create Group Slotlist Channel (#group-a-slots)
+            const groupSlotChannel = await guild.channels.create({
+              name: `${slug}-group-${groupLower}-slots`,
+              type: ChannelType.GuildText,
+              parent: groupCategory.id,
+              permissionOverwrites: [
+                {
+                  id: guild.roles.everyone.id,
+                  deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages],
+                },
+                {
+                  id: groupRole.id,
+                  allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
+                  deny: [PermissionFlagsBits.SendMessages],
+                },
+                {
+                  id: client.user.id,
+                  allow: [
+                    PermissionFlagsBits.ViewChannel,
+                    PermissionFlagsBits.SendMessages,
+                    PermissionFlagsBits.ManageMessages,
+                  ],
+                },
+              ],
+            });
+            tourney.createdGroups.channelIds.push(groupSlotChannel.id);
+
+            // 4. Create Separate Private Group IDP Channel (#group-a-idp)
+            const groupIdpChannel = await guild.channels.create({
+              name: `${slug}-group-${groupLower}-idp`,
+              type: ChannelType.GuildText,
+              parent: groupCategory.id,
+              permissionOverwrites: [
+                {
+                  id: guild.roles.everyone.id,
+                  deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages],
+                },
+                {
+                  id: groupRole.id,
+                  allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
+                  deny: [PermissionFlagsBits.SendMessages],
+                },
+                {
+                  id: client.user.id,
+                  allow: [
+                    PermissionFlagsBits.ViewChannel,
+                    PermissionFlagsBits.SendMessages,
+                    PermissionFlagsBits.ManageMessages,
+                  ],
+                },
+              ],
+            });
+            tourney.createdGroups.channelIds.push(groupIdpChannel.id);
+
+            // 5. Post Official Group Slotlist inside #group-x-slots
             const lines = slice.map(
-              (t, idx) => `\`Slot ${String(idx + 1).padStart(2, '0')}\` **${t.teamName}** (<@${t.leaderId}>)`
+              (t, idx) => `\`Slot ${String(idx + 1).padStart(2, '0')}\`  **${t.teamName}** — <@${t.leaderId}>`
             );
-            embeds.push(
-              new EmbedBuilder()
-                .setColor(BRAND_COLOR)
-                .setTitle(`${tourney.name} — Group ${groupLetter}`)
-                .setDescription(lines.join('\n'))
+            const groupEmbed = new EmbedBuilder()
+              .setColor(BRAND_COLOR)
+              .setTitle(`${tourney.name} — Group ${groupLetter} Official Slotlist`)
+              .setDescription(lines.join('\n'))
+              .addFields(
+                { name: 'Group Role', value: `<@&${groupRole.id}>`, inline: true },
+                { name: 'Dedicated IDP Channel', value: `<#${groupIdpChannel.id}>`, inline: true }
+              )
+              .setFooter({ text: 'ELYTRAx V1 Tournament Manager' })
+              .setTimestamp();
+
+            await groupSlotChannel.send({
+              content: `<@&${groupRole.id}>`,
+              embeds: [groupEmbed],
+            });
+
+            // 6. Post welcome notice inside #group-x-idp
+            await groupIdpChannel.send({
+              embeds: [
+                new EmbedBuilder()
+                  .setColor(SUCCESS_COLOR)
+                  .setTitle(`🔑 Group ${groupLetter} — Official IDP Channel`)
+                  .setDescription(
+                    `Room ID and Password for **Group ${groupLetter}** (<@&${groupRole.id}>) will be posted here before match start.\nCheck your assigned slot number in <#${groupSlotChannel.id}>.`
+                  ),
+              ],
+            });
+
+            summaryLines.push(
+              `• **Group ${groupLetter}** (${slice.length} teams) — Role: <@&${groupRole.id}> | Slots: <#${groupSlotChannel.id}> | IDP: <#${groupIdpChannel.id}>`
             );
           }
 
-          for (let i = 0; i < embeds.length; i += 10) {
-            await interaction.followUp({ embeds: embeds.slice(i, i + 10) });
+          saveDB();
+
+          return interaction.editReply({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(SUCCESS_COLOR)
+                .setTitle(`✅ Created ${totalGroups} Group(s) for ${tourney.name}`)
+                .setDescription(summaryLines.join('\n'))
+                .setFooter({ text: 'Use /idp and select the Group IDP channel & Group Role to send credentials!' }),
+            ],
+          });
+        }
+
+        if (sub === 'cleanup_groups') {
+          const regChannel = interaction.options.getChannel('reg_channel', true);
+          const tourney = db.tourneys[regChannel.id];
+          if (!tourney || !tourney.createdGroups) {
+            return interaction.reply({ content: '❌ No auto-created groups found for that tournament.', ephemeral: true });
           }
-          return;
+
+          await interaction.deferReply({ ephemeral: true });
+          const guild = interaction.guild;
+
+          for (const chId of tourney.createdGroups.channelIds || []) {
+            const ch = await guild.channels.fetch(chId).catch(() => null);
+            if (ch) await ch.delete().catch(() => null);
+          }
+          if (tourney.createdGroups.categoryId) {
+            const cat = await guild.channels.fetch(tourney.createdGroups.categoryId).catch(() => null);
+            if (cat) await cat.delete().catch(() => null);
+          }
+          for (const rId of tourney.createdGroups.roleIds || []) {
+            const r = await guild.roles.fetch(rId).catch(() => null);
+            if (r) await r.delete().catch(() => null);
+          }
+
+          tourney.createdGroups = { categoryId: null, roleIds: [], channelIds: [] };
+          saveDB();
+          return interaction.editReply(`🗑️ Deleted all Group roles and Group channels for **${tourney.name}**.`);
         }
 
         if (sub === 'export') {
@@ -897,17 +1345,49 @@ client.on('interactionCreate', async (interaction) => {
 
         if (sub === 'delete') {
           const regChannel = interaction.options.getChannel('reg_channel', true);
-          if (!db.tourneys[regChannel.id]) {
+          const deleteChannels = interaction.options.getBoolean('delete_channels') ?? false;
+          const tourney = db.tourneys[regChannel.id];
+          if (!tourney) {
             return interaction.reply({ content: '❌ No tournament found for that channel.', ephemeral: true });
           }
-          const removedName = db.tourneys[regChannel.id].name;
+
+          await interaction.deferReply({ ephemeral: true });
+          const removedName = tourney.name;
           delete db.tourneys[regChannel.id];
           saveDB();
-          return interaction.reply(`🗑️ Deleted tournament **${removedName}**.`);
+
+          if (deleteChannels) {
+            const guild = interaction.guild;
+            const allChannels = [
+              ...(tourney.createdGroups?.channelIds || []),
+              tourney.createdGroups?.categoryId,
+              tourney.regChannelId,
+              tourney.confirmChannelId,
+              tourney.idpChannelId,
+              tourney.categoryId,
+            ];
+            for (const chId of allChannels) {
+              if (chId) {
+                const ch = await guild.channels.fetch(chId).catch(() => null);
+                if (ch) await ch.delete().catch(() => null);
+              }
+            }
+            const allRoles = [...(tourney.createdGroups?.roleIds || []), tourney.roleId];
+            for (const rId of allRoles) {
+              if (rId) {
+                const r = await guild.roles.fetch(rId).catch(() => null);
+                if (r) await r.delete().catch(() => null);
+              }
+            }
+          }
+
+          return interaction.editReply(`🗑️ Deleted tournament **${removedName}**.`);
         }
       }
 
-      // 4. /tagcheck
+      // ======================================================================
+      // 4. /tagcheck & /eztag
+      // ======================================================================
       if (commandName === 'tagcheck') {
         const channel = interaction.options.getChannel('channel', true);
         const mentions = interaction.options.getInteger('mentions', true);
@@ -923,7 +1403,6 @@ client.on('interactionCreate', async (interaction) => {
         );
       }
 
-      // 5. /eztag
       if (commandName === 'eztag') {
         const channel = interaction.options.getChannel('channel', true);
         const enabled = interaction.options.getBoolean('enabled', true);
@@ -947,53 +1426,15 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply({ content: `✅ Enabled **EasyTag** in <#${channel.id}>.`, ephemeral: true });
       }
 
-      // 6. /ssverify
-      if (commandName === 'ssverify') {
-        const channel = interaction.options.getChannel('channel', true);
-        const role = interaction.options.getRole('verified_role', true);
-        const count = interaction.options.getInteger('required_screenshots', true);
-        const instructions =
-          interaction.options.getString('instructions') ||
-          'Upload your subscription/follow screenshots below to unlock your Verified Role.';
-
-        if (count === 0) {
-          delete db.ssverify[channel.id];
-          saveDB();
-          return interaction.reply(`🗑️ Disabled SS-Verify in <#${channel.id}>.`);
-        }
-
-        db.ssverify[channel.id] = {
-          roleId: role.id,
-          requiredCount: count,
-          submissions: {},
-        };
-        saveDB();
-
-        await channel.send({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(BRAND_COLOR)
-              .setTitle('📸 Screenshot Verification')
-              .setDescription(
-                [
-                  instructions,
-                  '',
-                  `• **Required Screenshots:** \`${count}\` image(s)`,
-                  `• **Role Granted:** <@&${role.id}>`,
-                ].join('\n')
-              )
-              .setFooter({ text: 'ELYTRAx V1 SS-Verify' }),
-          ],
-        });
-        return interaction.reply({ content: `✅ Configured **SS-Verify** in <#${channel.id}>.`, ephemeral: true });
-      }
-
-      // 7. /idp
+      // ======================================================================
+      // 5. /idp (Sends to Separate IDP Channel)
+      // ======================================================================
       if (commandName === 'idp') {
         const roomId = interaction.options.getString('room_id', true);
         const password = interaction.options.getString('password', true);
         const map = interaction.options.getString('map', true);
         const startTime = interaction.options.getString('start_time', true);
+        const targetChannel = interaction.options.getChannel('idp_channel') || interaction.channel;
         const pingRole = interaction.options.getRole('ping_role');
         const autoDeleteMins = interaction.options.getInteger('autodelete_mins');
 
@@ -1013,7 +1454,7 @@ client.on('interactionCreate', async (interaction) => {
           })
           .setTimestamp();
 
-        const sent = await interaction.channel.send({
+        const sent = await targetChannel.send({
           content: pingRole ? `<@&${pingRole.id}>` : null,
           embeds: [embed],
         });
@@ -1024,7 +1465,10 @@ client.on('interactionCreate', async (interaction) => {
           }, autoDeleteMins * 60 * 1000);
         }
 
-        return interaction.reply({ content: '✅ Room IDP posted.', ephemeral: true });
+        return interaction.reply({
+          content: `✅ Room IDP posted in <#${targetChannel.id}>.`,
+          ephemeral: true,
+        });
       }
     }
 
@@ -1208,14 +1652,19 @@ client.on('interactionCreate', async (interaction) => {
     }
   } catch (err) {
     console.error('[Interaction Error]:', err);
-    if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: `❌ Error: ${err.message}`, ephemeral: true }).catch(() => null);
+    if (interaction.isRepliable()) {
+      const msg = `❌ Error: ${err.message}. Make sure the bot has **Administrator** (or Manage Roles & Manage Channels) and its role is dragged above the roles it manages.`;
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({ content: msg }).catch(() => null);
+      } else {
+        await interaction.reply({ content: msg, ephemeral: true }).catch(() => null);
+      }
     }
   }
 });
 
 // ============================================================================
-// 6. MESSAGE PIPELINE (SCRIMS, TOURNEYS, TAGCHECK, EZTAG, SSVERIFY)
+// 6. MESSAGE PIPELINE (SCRIMS, TOURNEYS, TAGCHECK, EZTAG)
 // ============================================================================
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;
@@ -1288,6 +1737,8 @@ client.on('messageCreate', async (message) => {
     if (message.member) {
       await message.member.roles.add(scrim.idpRoleId).catch(() => null);
     }
+
+    await syncScrimSlotlistMessage(message.guild, scrim);
 
     if (scrim.slots.length >= scrim.totalSlots) {
       await closeScrimRegistration(message.guild, scrim, 'All slots filled!');
@@ -1363,7 +1814,8 @@ client.on('messageCreate', async (message) => {
         embeds: [
           new EmbedBuilder()
             .setColor(BRAND_COLOR)
-            .setTitle(`🔴 ${tourney.name} — Registrations Full (${tourney.totalSlots}/${tourney.totalSlots})`),
+            .setTitle(`🔴 ${tourney.name} — Registrations Full (${tourney.totalSlots}/${tourney.totalSlots})`)
+            .setDescription('Staff can now run `/tourney groups` to auto-create Group roles, slot channels, and separate Group IDP channels.'),
         ],
       });
     }
@@ -1424,47 +1876,6 @@ client.on('messageCreate', async (message) => {
       reply.delete().catch(() => null);
     }, 20000);
     return;
-  }
-
-  // --------------------------------------------------------------------------
-  // E. SCREENSHOT VERIFICATION (SSVERIFY) HANDLER
-  // --------------------------------------------------------------------------
-  const ssCfg = db.ssverify[channelId];
-  if (ssCfg) {
-    const validImages = message.attachments.filter((att) =>
-      Boolean(att.contentType && att.contentType.startsWith('image/'))
-    );
-
-    if (validImages.size === 0) {
-      await message.delete().catch(() => null);
-      const warn = await message.channel.send(
-        `❌ <@${message.author.id}>, please upload valid screenshot image(s) only.`
-      );
-      setTimeout(() => warn.delete().catch(() => null), 5000);
-      return;
-    }
-
-    const prevCount = ssCfg.submissions[message.author.id] || 0;
-    const newCount = prevCount + validImages.size;
-    ssCfg.submissions[message.author.id] = newCount;
-    saveDB();
-
-    if (newCount >= ssCfg.requiredCount) {
-      await message.react('✅').catch(() => null);
-      if (message.member) {
-        await message.member.roles.add(ssCfg.roleId).catch(() => null);
-      }
-      const doneMsg = await message.reply(
-        `✅ Verified! <@${message.author.id}> has uploaded \`${newCount}/${ssCfg.requiredCount}\` screenshots and unlocked <@&${ssCfg.roleId}>.`
-      );
-      setTimeout(() => doneMsg.delete().catch(() => null), 10000);
-    } else {
-      await message.react('⏳').catch(() => null);
-      const waitMsg = await message.reply(
-        `📸 Received \`${newCount}/${ssCfg.requiredCount}\` screenshots. Upload \`${ssCfg.requiredCount - newCount}\` more to unlock <@&${ssCfg.roleId}>.`
-      );
-      setTimeout(() => waitMsg.delete().catch(() => null), 8000);
-    }
   }
 });
 
