@@ -58,7 +58,7 @@ function loadDB() {
     }
     const raw = fs.readFileSync(DB_FILE, 'utf8');
     const parsed = JSON.parse(raw);
-    delete parsed.ssverify; // Clean up legacy ssverify key if present
+    delete parsed.ssverify;
     return { ...defaultDB, ...parsed };
   } catch (err) {
     console.error('[DB] Failed to load database, initializing fresh state:', err.message);
@@ -292,31 +292,31 @@ async function closeScrimRegistration(guild, scrim, reason = 'All slots filled o
 }
 
 // ============================================================================
-// 3. SLASH COMMAND DEFINITIONS (NO SSVERIFY, NO PT MAKER)
+// 3. SLASH COMMAND DEFINITIONS (ALL DESCRIPTIONS <= 80 CHARS FOR DISCORD API)
 // ============================================================================
 const commands = [
   // 1. SCRIM MANAGER
   new SlashCommandBuilder()
     .setName('scrim')
-    .setDescription('Manage automated esports scrims with auto-created roles & separate IDP channel')
+    .setDescription('Manage automated esports scrims, roles, and IDP channels')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand((sub) =>
       sub
         .setName('create')
-        .setDescription('Create a scrim (auto-creates IDP Role, #register, #slotlist, & private #idp if omitted)')
+        .setDescription('Create a scrim and auto-create role, slotlist, and IDP channels')
         .addStringOption((o) => o.setName('name').setDescription('Scrim title (e.g. Elytra Evening Scrims)').setRequired(true))
         .addIntegerOption((o) => o.setName('total_slots').setDescription('Total slots (e.g. 16, 20, 25)').setMinValue(2).setMaxValue(30).setRequired(true))
         .addIntegerOption((o) => o.setName('mentions').setDescription('Required @mentions per team (e.g. 4)').setMinValue(0).setMaxValue(6).setRequired(true))
         .addChannelOption((o) =>
-          o.setName('reg_channel').setDescription('Existing registration channel (leave blank to auto-create)').addChannelTypes(ChannelType.GuildText)
+          o.setName('reg_channel').setDescription('Existing registration channel (optional)').addChannelTypes(ChannelType.GuildText)
         )
         .addChannelOption((o) =>
-          o.setName('slot_channel').setDescription('Existing slotlist channel (leave blank to auto-create)').addChannelTypes(ChannelType.GuildText)
+          o.setName('slot_channel').setDescription('Existing slotlist channel (optional)').addChannelTypes(ChannelType.GuildText)
         )
         .addChannelOption((o) =>
-          o.setName('idp_channel').setDescription('Existing separate IDP channel (leave blank to auto-create private IDP channel)').addChannelTypes(ChannelType.GuildText)
+          o.setName('idp_channel').setDescription('Existing separate IDP channel (optional)').addChannelTypes(ChannelType.GuildText)
         )
-        .addRoleOption((o) => o.setName('idp_role').setDescription('Existing IDP role (leave blank to auto-create role)'))
+        .addRoleOption((o) => o.setName('idp_role').setDescription('Existing IDP role (optional)'))
         .addStringOption((o) => o.setName('open_time').setDescription('Daily auto-open time in IST 24h format (e.g. 14:00)'))
         .addRoleOption((o) => o.setName('ping_role').setDescription('Role to ping when registration opens'))
         .addBooleanOption((o) => o.setName('auto_clean').setDescription('Purge old messages in reg channel before opening'))
@@ -363,19 +363,19 @@ const commands = [
     .addSubcommand((sub) =>
       sub
         .setName('delete')
-        .setDescription('Delete a scrim configuration (and optionally its auto-created channels/role)')
+        .setDescription('Delete a scrim configuration and its channels/role')
         .addChannelOption((o) =>
           o.setName('reg_channel').setDescription('Scrim registration channel').addChannelTypes(ChannelType.GuildText).setRequired(true)
         )
         .addBooleanOption((o) =>
-          o.setName('delete_channels').setDescription('Also delete the scrim channels and IDP role from the server')
+          o.setName('delete_channels').setDescription('Also delete the scrim channels and IDP role')
         )
     ),
 
   // 2. SLOT MANAGER (CANCEL / CLAIM / TRANSFER)
   new SlashCommandBuilder()
     .setName('slotm')
-    .setDescription('Deploy interactive Cancel / Claim / Transfer slot panel')
+    .setDescription('Deploy interactive Cancel, Claim, and Transfer slot panel')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand((sub) =>
       sub
@@ -386,28 +386,28 @@ const commands = [
         )
     ),
 
-  // 3. TOURNAMENT MANAGER (WITH AUTO ROLE/CHANNEL CREATION & GROUP CHANNEL/ROLE GENERATOR)
+  // 3. TOURNAMENT MANAGER
   new SlashCommandBuilder()
     .setName('tourney')
-    .setDescription('Manage tournaments, auto-create Group roles/channels + separate IDP channels, & export CSV')
+    .setDescription('Manage tournaments, group roles/channels, IDP channels, and CSV export')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand((sub) =>
       sub
         .setName('create')
-        .setDescription('Create a tournament (auto-creates Role, #register, #confirmed, & private #idp if omitted)')
+        .setDescription('Create a tournament and auto-create role and channels')
         .addStringOption((o) => o.setName('name').setDescription('Tournament name').setRequired(true))
         .addIntegerOption((o) => o.setName('total_slots').setDescription('Total tournament slots (e.g. 24, 32, 64, 128)').setMinValue(4).setMaxValue(500).setRequired(true))
         .addIntegerOption((o) => o.setName('mentions').setDescription('Required @mentions per squad').setMinValue(0).setMaxValue(6).setRequired(true))
         .addChannelOption((o) =>
-          o.setName('reg_channel').setDescription('Existing registration channel (leave blank to auto-create)').addChannelTypes(ChannelType.GuildText)
+          o.setName('reg_channel').setDescription('Existing registration channel (optional)').addChannelTypes(ChannelType.GuildText)
         )
         .addChannelOption((o) =>
-          o.setName('confirm_channel').setDescription('Existing confirmed teams channel (leave blank to auto-create)').addChannelTypes(ChannelType.GuildText)
+          o.setName('confirm_channel').setDescription('Existing confirmed teams channel (optional)').addChannelTypes(ChannelType.GuildText)
         )
         .addChannelOption((o) =>
-          o.setName('idp_channel').setDescription('Existing separate IDP channel (leave blank to auto-create)').addChannelTypes(ChannelType.GuildText)
+          o.setName('idp_channel').setDescription('Existing separate IDP channel (optional)').addChannelTypes(ChannelType.GuildText)
         )
-        .addRoleOption((o) => o.setName('role').setDescription('Existing captain role (leave blank to auto-create role)'))
+        .addRoleOption((o) => o.setName('role').setDescription('Existing captain role (optional)'))
     )
     .addSubcommand((sub) =>
       sub
@@ -428,17 +428,17 @@ const commands = [
     .addSubcommand((sub) =>
       sub
         .setName('groups')
-        .setDescription('Divide teams into Groups & AUTO-CREATE Group Roles, Group Slot Channels, & separate Group IDP Channels')
+        .setDescription('Divide teams into groups with auto-created roles and IDP channels')
         .addChannelOption((o) =>
           o.setName('reg_channel').setDescription('Tournament registration channel').addChannelTypes(ChannelType.GuildText).setRequired(true)
         )
-        .addIntegerOption((o) => o.setName('group_size').setDescription('Teams per group (e.g. 12 for Free Fire, 16 or 20 for BGMI)').setMinValue(2).setMaxValue(30).setRequired(true))
+        .addIntegerOption((o) => o.setName('group_size').setDescription('Teams per group (e.g. 12, 16, or 20)').setMinValue(2).setMaxValue(30).setRequired(true))
         .addBooleanOption((o) => o.setName('shuffle').setDescription('Shuffle teams randomly before grouping'))
     )
     .addSubcommand((sub) =>
       sub
         .setName('cleanup_groups')
-        .setDescription('Delete all auto-created Group Roles and Group Channels for a tournament')
+        .setDescription('Delete all auto-created group roles and channels for a tourney')
         .addChannelOption((o) =>
           o.setName('reg_channel').setDescription('Tournament registration channel').addChannelTypes(ChannelType.GuildText).setRequired(true)
         )
@@ -463,19 +463,19 @@ const commands = [
     .addSubcommand((sub) =>
       sub
         .setName('delete')
-        .setDescription('Delete a tournament configuration (and optionally all its created roles/channels)')
+        .setDescription('Delete a tournament configuration and its channels/roles')
         .addChannelOption((o) =>
           o.setName('reg_channel').setDescription('Tournament registration channel').addChannelTypes(ChannelType.GuildText).setRequired(true)
         )
         .addBooleanOption((o) =>
-          o.setName('delete_channels').setDescription('Also delete created tournament/group channels and roles')
+          o.setName('delete_channels').setDescription('Also delete created tournament and group channels/roles')
         )
     ),
 
   // 4. TAGCHECK & EASYTAG
   new SlashCommandBuilder()
     .setName('tagcheck')
-    .setDescription('Configure a Tag Check channel to validate squad registration format')
+    .setDescription('Configure a Tag Check channel to validate registration format')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addChannelOption((o) =>
       o.setName('channel').setDescription('Channel for Tag Check').addChannelTypes(ChannelType.GuildText).setRequired(true)
@@ -486,7 +486,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('eztag')
-    .setDescription('Configure an EasyTag channel to convert raw tags into registration format')
+    .setDescription('Configure an EasyTag channel to format squad mentions')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addChannelOption((o) =>
       o.setName('channel').setDescription('Channel for EasyTag').addChannelTypes(ChannelType.GuildText).setRequired(true)
@@ -495,17 +495,17 @@ const commands = [
       o.setName('enabled').setDescription('Enable or disable EasyTag in this channel').setRequired(true)
     ),
 
-  // 5. IDP BROADCASTER (SENDS DIRECTLY TO SEPARATE IDP CHANNEL)
+  // 5. IDP BROADCASTER
   new SlashCommandBuilder()
     .setName('idp')
-    .setDescription('Broadcast formatted Room ID & Password embed to a dedicated IDP channel')
+    .setDescription('Broadcast formatted Room ID and Password to an IDP channel')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
     .addStringOption((o) => o.setName('room_id').setDescription('Custom Room ID').setRequired(true))
     .addStringOption((o) => o.setName('password').setDescription('Room Password').setRequired(true))
     .addStringOption((o) => o.setName('map').setDescription('Map name (e.g. Erangel, Miramar, Rondo, Bermuda)').setRequired(true))
     .addStringOption((o) => o.setName('start_time').setDescription('Match start time (e.g. 08:15 PM IST)').setRequired(true))
     .addChannelOption((o) =>
-      o.setName('idp_channel').setDescription('Target separate IDP channel (defaults to current channel if omitted)').addChannelTypes(ChannelType.GuildText)
+      o.setName('idp_channel').setDescription('Target separate IDP channel (optional)').addChannelTypes(ChannelType.GuildText)
     )
     .addRoleOption((o) => o.setName('ping_role').setDescription('IDP or Group Role to ping'))
     .addIntegerOption((o) =>
@@ -715,7 +715,6 @@ client.on('interactionCreate', async (interaction) => {
           };
           saveDB();
 
-          // Post initial Slotlist + Cancel/Claim buttons in slotChannel
           await syncScrimSlotlistMessage(guild, db.scrims[regChannel.id]);
 
           return interaction.editReply({
@@ -1148,7 +1147,7 @@ client.on('interactionCreate', async (interaction) => {
           const slug = slugifyChannelName(tourney.name);
 
           for (let g = 0; g < totalGroups; g++) {
-            const groupLetter = String.fromCharCode(65 + g); // A, B, C...
+            const groupLetter = String.fromCharCode(65 + g);
             const groupLower = groupLetter.toLowerCase();
             const slice = list.slice(g * groupSize, (g + 1) * groupSize);
 
